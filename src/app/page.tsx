@@ -108,9 +108,6 @@ export default function Home() {
       // Browsers can usually decode: jpg, png, webp, gif, svg, bmp, ico
       const useCanvasDecoder = ['svg', 'ico', 'webp'];
 
-      // canvas supported encoders: png, jpeg, webp
-      // We can use canvas to decode SVG/ICO/WEBP -> PNG/JPG directly
-
       const isInputComplex = useCanvasDecoder.includes(action.from.toLowerCase());
 
       if (isInputComplex) {
@@ -120,27 +117,60 @@ export default function Home() {
         const intermediateFormat = isTargetCanvasSupported ? to : 'png';
 
         // Convert to intermediate (or final) blob using Canvas
-        const blob = await convertImageViaCanvas(file, intermediateFormat);
+        // Now returns object with blob and dimensions
+        try {
+          const { blob, width, height } = await convertImageViaCanvas(file, intermediateFormat);
 
-        if (isTargetCanvasSupported) {
-          outputBlob = blob;
-        } else {
-          // We have a PNG blob, now use FFmpeg to convert PNG -> Target (e.g. ICO)
-          if (!ffmpeg) throw new Error("FFmpeg not loaded for complex conversion");
+          if (isTargetCanvasSupported) {
+            outputBlob = blob;
+          } else if (to.toLowerCase() === 'svg') {
+            // Complex -> PNG -> SVG (Wrap)
+            outputBlob = await createSvgFromBlob(blob, width, height);
+          } else {
+            // We have a PNG blob, now use FFmpeg to convert PNG -> Target (e.g. ICO)
+            if (!ffmpeg) throw new Error("FFmpeg not loaded for complex conversion");
 
-          const tempName = `temp.${intermediateFormat}`;
-          const outputName = `output.${to}`;
+            const tempName = `temp.${intermediateFormat}`;
+            const outputName = `output.${to}`;
 
-          await ffmpeg.writeFile(tempName, new Uint8Array(await blob.arrayBuffer()));
+            await ffmpeg.writeFile(tempName, new Uint8Array(await blob.arrayBuffer()));
 
-          // Special args for ICO
-          const args = ['-i', tempName];
-          if (to === 'ico') args.push('-s', '256x256'); // ICO needs specific sizes
-          args.push(outputName);
+            // Special args for ICO
+            const args = ['-i', tempName];
+            if (to === 'ico') args.push('-s', '256x256');
+            args.push(outputName);
 
-          await ffmpeg.exec(args);
-          const data = await ffmpeg.readFile(outputName);
-          outputBlob = new Blob([data], { type: `image/${to}` });
+            await ffmpeg.exec(args);
+            const data = await ffmpeg.readFile(outputName);
+            outputBlob = new Blob([data], { type: `image/${to}` });
+          }
+        } catch (canvasErr) {
+          console.warn("Canvas conversion failed, trying FFmpeg fallback", canvasErr);
+
+          // Fallback specifically for ICO -> SVG (or others if needed)
+          // Try FFmpeg directly to PNG, then wrapping if needed
+          if (!ffmpeg) throw canvasErr;
+
+          await ffmpeg.writeFile(file.name, await fetchFile(file));
+
+          if (to.toLowerCase() === 'svg') {
+            // ICO (via FFmpeg) -> PNG -> SVG
+            const tempPng = "fallback.png";
+            await ffmpeg.exec(['-i', file.name, tempPng]);
+            const data = await ffmpeg.readFile(tempPng);
+            const pngBlob = new Blob([data], { type: 'image/png' });
+            const { width, height } = await getImageDims(pngBlob);
+            outputBlob = await createSvgFromBlob(pngBlob, width, height);
+          } else {
+            // Simple FFmpeg fallback
+            const outputName = file.name.replace(/\.[^/.]+$/, "") + "." + to;
+            const args = ['-i', file.name];
+            if (to === 'ico') args.push('-s', '256x256');
+            args.push(outputName);
+            await ffmpeg.exec(args);
+            const data = await ffmpeg.readFile(outputName);
+            outputBlob = new Blob([data], { type: `image/${to}` });
+          }
         }
 
       } else if (to.toLowerCase() === 'svg') {
@@ -379,7 +409,7 @@ export default function Home() {
 }
 
 // Helper functions
-async function convertImageViaCanvas(file: File, outputFormat: string): Promise<Blob> {
+async function convertImageViaCanvas(file: File, outputFormat: string): Promise<{ blob: Blob, width: number, height: number }> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
@@ -397,7 +427,7 @@ async function convertImageViaCanvas(file: File, outputFormat: string): Promise<
 
       canvas.toBlob((blob) => {
         if (!blob) reject(new Error("Conversion failed"));
-        else resolve(blob);
+        else resolve({ blob, width: img.width, height: img.height });
       }, mime);
 
       URL.revokeObjectURL(url);
@@ -411,14 +441,26 @@ async function convertImageViaCanvas(file: File, outputFormat: string): Promise<
   });
 }
 
+function createSvgFromBlob(blob: Blob, width: number, height: number): Promise<Blob> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const b64 = reader.result as string;
+      const svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+  <image href="${b64}" width="100%" height="100%" />
+</svg>`;
+      resolve(new Blob([svgContent], { type: 'image/svg+xml' }));
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
 async function convertImageToSvg(file: File): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
 
     img.onload = () => {
-      const canvas = document.createElement('canvas'); // Used getting simple base64? No, direct reader is better.
-      // Actually, we need width/height for the SVG tag
       const width = img.width;
       const height = img.height;
       URL.revokeObjectURL(url);
@@ -434,6 +476,23 @@ async function convertImageToSvg(file: File): Promise<Blob> {
       reader.readAsDataURL(file);
     };
     img.onerror = () => reject(new Error("Failed to load image for SVG conversion"));
+    img.src = url;
+  });
+}
+
+async function getImageDims(blob: Blob): Promise<{ width: number, height: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      const dims = { width: img.width, height: img.height };
+      URL.revokeObjectURL(url);
+      resolve(dims);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Failed to load image for dimensions"));
+    };
     img.src = url;
   });
 }
