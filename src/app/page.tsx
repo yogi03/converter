@@ -34,14 +34,21 @@ export default function Home() {
   const [isConverting, setIsConverting] = useState(false)
   const ffmpegRef = useRef<any>(null)
 
+  const [isSupported, setIsSupported] = useState(true)
+
   const load = async () => {
     setIsLoaded(true)
     const ffmpeg = new FFmpeg()
     ffmpegRef.current = ffmpeg
 
-    // Log to console so user can see what's happening
+    // Log to console and check for hevc support
     ffmpeg.on('log', ({ message }) => {
       console.log(message)
+      if (message.includes('libx265')) {
+        // This is a naive check, but if -encoders lists it, it usually means it's there.
+        // However, standard ffmpeg builds force disable it.
+        // This log might appear during -encoders execution.
+      }
     })
 
     const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd'
@@ -54,6 +61,24 @@ export default function Home() {
       setIsReady(true)
       setIsLoaded(false)
       console.log("FFmpeg loaded")
+
+      // Explicit check: Run encoders command and verify output
+      let hasHevc = false;
+      const logHandler = ({ message }: { message: string }) => {
+        if (message.includes("libx265") && message.includes("V.....")) { // V..... indicates video encoder
+          hasHevc = true;
+        }
+      };
+      ffmpeg.on('log', logHandler);
+      await ffmpeg.exec(['-encoders']);
+      ffmpeg.off('log', logHandler);
+
+      console.log("HEVC Support:", hasHevc);
+      if (!hasHevc) {
+        toast.error("HEIC encoding (output) is not supported in this browser environment due to standard library limitations. HEIC input (decoding) is still supported.");
+        setIsSupported(false); // We can use this to hide the option
+      }
+
     } catch (error) {
       console.error("FFmpeg load failed", error)
       setIsLoaded(false)
@@ -103,31 +128,65 @@ export default function Home() {
       let outputBlob: Blob;
       let outputUrl: string;
       const ffmpeg = ffmpegRef.current;
-
-      // Browser-native supported formats for decoding
-      // Browsers can usually decode: jpg, png, webp, gif, svg, bmp, ico
-      const useCanvasDecoder = ['svg', 'ico', 'webp'];
-
+      const useCanvasDecoder = ['svg', 'ico', 'webp', 'heic', 'heif'];
       const isInputComplex = useCanvasDecoder.includes(action.from.toLowerCase());
 
       if (isInputComplex) {
-        // Fallback: Use Browser Canvas to decode
-        const standardFormats = ['jpg', 'jpeg', 'png', 'webp'];
-        const isTargetCanvasSupported = standardFormats.includes(to.toLowerCase());
-        const intermediateFormat = isTargetCanvasSupported ? to : 'png';
+        if (action.from.toLowerCase() === 'heic' || action.from.toLowerCase() === 'heif') {
+          // Dynamic import
+          const heic2any = (await import('heic2any')).default;
+          const convertedBlob = await heic2any({
+            blob: file,
+            toType: "image/png",
+            quality: 1
+          }) as Blob;
 
-        // Convert to intermediate (or final) blob using Canvas
-        // Now returns object with blob and dimensions
-        try {
+          const standardFormats = ['jpg', 'jpeg', 'png', 'webp'];
+          if (standardFormats.includes(to.toLowerCase())) {
+            if (to.toLowerCase() === 'png') {
+              outputBlob = convertedBlob;
+            } else {
+              const { blob } = await convertImageViaCanvas(new File([convertedBlob], "temp.png", { type: "image/png" }), to);
+              outputBlob = blob;
+            }
+          } else if (to.toLowerCase() === 'svg') {
+            const { width, height } = await getImageDims(convertedBlob);
+            outputBlob = await createSvgFromBlob(convertedBlob, width, height);
+          } else {
+            if (!ffmpeg) throw new Error("FFmpeg not loaded for complex conversion");
+            const tempName = `temp.png`;
+            const outputName = `output.${to}`;
+            await ffmpeg.writeFile(tempName, new Uint8Array(await convertedBlob.arrayBuffer()));
+
+            const args = ['-i', tempName];
+            if (to === 'ico') args.push('-s', '256x256');
+            if (to === 'heic') args.push(
+              '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+              '-c:v', 'libx265',
+              '-pix_fmt', 'yuv420p'
+            );
+            args.push(outputName);
+
+            const ret = await ffmpeg.exec(args);
+            if (ret !== 0) throw new Error(`FFmpeg conversion failed with code ${ret}`);
+
+            const data = await ffmpeg.readFile(outputName);
+            outputBlob = new Blob([data], { type: `image/${to}` });
+          }
+
+        } else {
+          // Fallback: Use Browser Canvas to decode SVG/ICO/WEBP
+          const standardFormats = ['jpg', 'jpeg', 'png', 'webp'];
+          const isTargetCanvasSupported = standardFormats.includes(to.toLowerCase());
+          const intermediateFormat = isTargetCanvasSupported ? to : 'png';
+
           const { blob, width, height } = await convertImageViaCanvas(file, intermediateFormat);
 
           if (isTargetCanvasSupported) {
             outputBlob = blob;
           } else if (to.toLowerCase() === 'svg') {
-            // Complex -> PNG -> SVG (Wrap)
             outputBlob = await createSvgFromBlob(blob, width, height);
           } else {
-            // We have a PNG blob, now use FFmpeg to convert PNG -> Target (e.g. ICO)
             if (!ffmpeg) throw new Error("FFmpeg not loaded for complex conversion");
 
             const tempName = `temp.${intermediateFormat}`;
@@ -135,59 +194,26 @@ export default function Home() {
 
             await ffmpeg.writeFile(tempName, new Uint8Array(await blob.arrayBuffer()));
 
-            // Special args for ICO
             const args = ['-i', tempName];
             if (to === 'ico') args.push('-s', '256x256');
+            if (to === 'heic') args.push(
+              '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+              '-c:v', 'libx265',
+              '-preset', 'ultrafast',
+              '-tag:v', 'hvc1',
+              '-pix_fmt', 'yuv420p'
+            );
             args.push(outputName);
 
             await ffmpeg.exec(args);
             const data = await ffmpeg.readFile(outputName);
             outputBlob = new Blob([data], { type: `image/${to}` });
           }
-        } catch (canvasErr) {
-          console.warn("Canvas conversion failed, trying FFmpeg fallback", canvasErr);
-
-          // Fallback specifically for ICO -> SVG (or others if needed)
-          // Try FFmpeg directly to PNG, then wrapping if needed
-          if (!ffmpeg) throw canvasErr;
-
-          await ffmpeg.writeFile(file.name, await fetchFile(file));
-
-          if (to.toLowerCase() === 'svg') {
-            // ICO (via FFmpeg) -> PNG -> SVG
-            const tempPng = "fallback.png";
-            const ret = await ffmpeg.exec(['-i', file.name, tempPng]);
-            if (ret !== 0) throw new Error(`FFmpeg fallback (to PNG) failed with code ${ret}`);
-
-            const data = await ffmpeg.readFile(tempPng);
-            const pngBlob = new Blob([data], { type: 'image/png' });
-            const { width, height } = await getImageDims(pngBlob);
-            outputBlob = await createSvgFromBlob(pngBlob, width, height);
-          } else {
-            // Simple FFmpeg fallback
-            const outputName = file.name.replace(/\.[^/.]+$/, "") + "." + to;
-            const args = ['-i', file.name];
-            if (to === 'ico') args.push('-s', '256x256');
-            if (to === 'heic') args.push('-c:v', 'libx265', '-pix_fmt', 'yuv420p');
-            args.push(outputName);
-
-            const ret = await ffmpeg.exec(args);
-            if (ret !== 0) throw new Error(`FFmpeg fallback failed with code ${ret}`);
-
-            try {
-              const data = await ffmpeg.readFile(outputName);
-              outputBlob = new Blob([data], { type: `image/${to}` });
-            } catch (readErr) {
-              throw new Error(`Output file not created after fallback: ${readErr}`);
-            }
-          }
         }
 
       } else if (to.toLowerCase() === 'svg') {
-        // Image -> SVG (Wrap in SVG tag)
         outputBlob = await convertImageToSvg(file);
       } else {
-        // Standard FFmpeg conversion
         if (!ffmpeg) throw new Error("FFmpeg not loaded");
 
         await ffmpeg.writeFile(file.name, await fetchFile(file));
@@ -195,7 +221,13 @@ export default function Home() {
 
         const args = ['-i', file.name];
         if (to === 'ico') args.push('-s', '256x256');
-        if (to === 'heic') args.push('-c:v', 'libx265', '-pix_fmt', 'yuv420p');
+        if (to === 'heic') args.push(
+          '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+          '-c:v', 'libx265',
+          '-preset', 'ultrafast',
+          '-tag:v', 'hvc1',
+          '-pix_fmt', 'yuv420p'
+        );
         args.push(outputName);
 
         const ret = await ffmpeg.exec(args);
@@ -383,9 +415,12 @@ export default function Home() {
                             <SelectValue placeholder="..." />
                           </SelectTrigger>
                           <SelectContent>
-                            {['jpg', 'png', 'webp', 'ico', 'svg', 'heic'].filter(x => x !== action.from.toLowerCase()).map((t) => (
-                              <SelectItem key={t} value={t}>{t.toUpperCase()}</SelectItem>
-                            ))}
+                            {['jpg', 'png', 'webp', 'ico', 'svg', 'heic']
+                              .filter(x => x !== action.from.toLowerCase())
+                              .filter(x => isSupported || x !== 'heic') // Hide HEIC if not supported
+                              .map((t) => (
+                                <SelectItem key={t} value={t}>{t.toUpperCase()}</SelectItem>
+                              ))}
                           </SelectContent>
                         </Select>
                       </>
