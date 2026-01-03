@@ -27,6 +27,8 @@ export default function Dropzone({ handleUpload }: DropzoneProps) {
         onDragLeave: () => setIsHover(false),
         accept: {
             'image/*': [],
+            'image/heic': ['.heic'],
+            'image/heif': ['.heif'],
         }
     })
 
@@ -56,6 +58,7 @@ export default function Dropzone({ handleUpload }: DropzoneProps) {
                     <span className="bg-background px-2 py-1 rounded-md border shadow-sm">PNG</span>
                     <span className="bg-background px-2 py-1 rounded-md border shadow-sm">WEBP</span>
                     <span className="bg-background px-2 py-1 rounded-md border shadow-sm">SVG</span>
+                    <span className="bg-background px-2 py-1 rounded-md border shadow-sm">HEIC</span>
                 </div>
             </CardContent>
         </Card>

@@ -156,7 +156,9 @@ export default function Home() {
           if (to.toLowerCase() === 'svg') {
             // ICO (via FFmpeg) -> PNG -> SVG
             const tempPng = "fallback.png";
-            await ffmpeg.exec(['-i', file.name, tempPng]);
+            const ret = await ffmpeg.exec(['-i', file.name, tempPng]);
+            if (ret !== 0) throw new Error(`FFmpeg fallback (to PNG) failed with code ${ret}`);
+
             const data = await ffmpeg.readFile(tempPng);
             const pngBlob = new Blob([data], { type: 'image/png' });
             const { width, height } = await getImageDims(pngBlob);
@@ -166,10 +168,18 @@ export default function Home() {
             const outputName = file.name.replace(/\.[^/.]+$/, "") + "." + to;
             const args = ['-i', file.name];
             if (to === 'ico') args.push('-s', '256x256');
+            if (to === 'heic') args.push('-c:v', 'libx265', '-pix_fmt', 'yuv420p');
             args.push(outputName);
-            await ffmpeg.exec(args);
-            const data = await ffmpeg.readFile(outputName);
-            outputBlob = new Blob([data], { type: `image/${to}` });
+
+            const ret = await ffmpeg.exec(args);
+            if (ret !== 0) throw new Error(`FFmpeg fallback failed with code ${ret}`);
+
+            try {
+              const data = await ffmpeg.readFile(outputName);
+              outputBlob = new Blob([data], { type: `image/${to}` });
+            } catch (readErr) {
+              throw new Error(`Output file not created after fallback: ${readErr}`);
+            }
           }
         }
 
@@ -185,11 +195,18 @@ export default function Home() {
 
         const args = ['-i', file.name];
         if (to === 'ico') args.push('-s', '256x256');
+        if (to === 'heic') args.push('-c:v', 'libx265', '-pix_fmt', 'yuv420p');
         args.push(outputName);
 
-        await ffmpeg.exec(args);
-        const data = await ffmpeg.readFile(outputName);
-        outputBlob = new Blob([data], { type: `image/${to}` });
+        const ret = await ffmpeg.exec(args);
+        if (ret !== 0) throw new Error(`FFmpeg conversion failed with code ${ret}`);
+
+        try {
+          const data = await ffmpeg.readFile(outputName);
+          outputBlob = new Blob([data], { type: `image/${to}` });
+        } catch (readErr) {
+          throw new Error(`Output file not created in standard path: ${readErr}`);
+        }
       }
 
       outputUrl = URL.createObjectURL(outputBlob);
@@ -366,7 +383,7 @@ export default function Home() {
                             <SelectValue placeholder="..." />
                           </SelectTrigger>
                           <SelectContent>
-                            {['jpg', 'png', 'webp', 'ico', 'svg'].filter(x => x !== action.from.toLowerCase()).map((t) => (
+                            {['jpg', 'png', 'webp', 'ico', 'svg', 'heic'].filter(x => x !== action.from.toLowerCase()).map((t) => (
                               <SelectItem key={t} value={t}>{t.toUpperCase()}</SelectItem>
                             ))}
                           </SelectContent>
